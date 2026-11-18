@@ -1,5 +1,5 @@
 name: 'AI-Pull Request Reviewer'
-description: 'Provider-agnostic, language-agnostic GitHub Action that reviews pull request diffs with Gemini, OpenAI, Anthropic, or any OpenAI-compatible API and upserts one structured review comment.'
+description: 'Provider-agnostic, language-agnostic GitHub Action that reviews pull request diffs with any OpenAI-compatible API and upserts one structured review comment.'
 branding:
   icon: 'check-circle'
   color: 'blue'
