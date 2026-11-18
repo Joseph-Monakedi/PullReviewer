@@ -50,10 +50,10 @@ flowchart LR
 
 ---
 
-## Quick Start
+## Quick Start (Ready-to-Use Workflow)
 
-1. Add your AI provider's API key as a repository secret named `AI_API_KEY` (**Settings → Secrets and variables → Actions**).
-2. Create `.github/workflows/ai-pr-review.yml`:
+1. Add your AI provider's API key as a repository secret named `AI_API_KEY` (**Settings → Secrets and variables → Actions → New repository secret**).
+2. Drop the following into `.github/workflows/ai-pr-review.yml` in any repository:
 
 ```yaml
 name: AI PR Review
@@ -79,8 +79,13 @@ jobs:
       - name: Run AI PR Reviewer
         uses: Joseph-Monakedi/PullReviewer@v1
         with:
+          provider: auto # auto, gemini, openai, anthropic, or openai-compatible
           api_key: ${{ secrets.AI_API_KEY }}
-          model: gemini-3.8-flash # or gpt-4.1-mini, claude-sonnet-4-20250514, etc.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          model: gemini-3.8-flash # or gpt-4.1-mini, claude-sonnet-4-20250514, deepseek/deepseek-r1, etc.
+          max_files: '50'
+          max_diff_chars: '100000'
+          max_findings: '20'
 ```
 
 ### Provider Configuration Examples
