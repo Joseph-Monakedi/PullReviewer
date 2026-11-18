@@ -1,4 +1,4 @@
-name: Gemini PR Review
+name: AI PR Review
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: gemini-pr-review-${{ github.event.pull_request.number }}
+  group: ai-pr-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -18,13 +18,19 @@ jobs:
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     steps:
-      - name: Run Gemini PR Reviewer
-        uses: YOUR_ORG/gemini-pr-reviewer@v1
+      - name: Run AI PR Reviewer
+        uses: YOUR_ORG/ai-pr-reviewer@v1
         with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          # Works with any provider: "auto" (default), "gemini", "openai", "anthropic", or "openai-compatible"
+          provider: auto
+          api_key: ${{ secrets.AI_API_KEY }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Examples:
+          #   Gemini:    gemini-3.8-flash
+          #   OpenAI:    gpt-4.1-mini  or  o3-mini
+          #   Anthropic: claude-sonnet-4-20250514
+          #   OpenRouter/DeepSeek: deepseek/deepseek-r1 (with base_url: https://openrouter.ai/api/v1)
           model: gemini-3.8-flash
           max_files: '50'
           max_diff_chars: '100000'
           max_findings: '20'
-

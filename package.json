@@ -1,7 +1,7 @@
 {
-  "name": "gemini-pr-reviewer",
+  "name": "ai-pr-reviewer",
   "version": "1.0.0",
-  "description": "Language-agnostic, Gemini-powered pull request reviewer packaged as a GitHub Action.",
+  "description": "Provider-agnostic, language-agnostic pull request reviewer packaged as a GitHub Action (Gemini, OpenAI, Anthropic, and OpenAI-compatible APIs).",
   "private": true,
   "type": "module",
   "license": "MIT",

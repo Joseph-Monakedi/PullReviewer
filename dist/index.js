@@ -42846,17 +42846,19 @@ var ConfigError = class extends Error {
 var MissingApiKeyError = class extends ConfigError {
   name = "MissingApiKeyError";
 };
-var GeminiError = class extends Error {
-  constructor(message, status, retryable, retryAfterMs) {
+var AiProviderError = class extends Error {
+  constructor(message, status, retryable, retryAfterMs, provider) {
     super(message);
     this.status = status;
     this.retryable = retryable;
     this.retryAfterMs = retryAfterMs;
+    this.provider = provider;
   }
   status;
   retryable;
   retryAfterMs;
-  name = "GeminiError";
+  provider;
+  name = "AiProviderError";
 };
 var ResponseValidationError = class extends Error {
   name = "ResponseValidationError";
@@ -42875,7 +42877,19 @@ function registerSecret(value) {
 }
 var CREDENTIAL_PATTERNS = [
   /AIza[0-9A-Za-z_-]{30,}/g,
-  // Google API keys
+  // Google / Gemini API keys
+  /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g,
+  // Anthropic API keys
+  /\bsk-proj-[A-Za-z0-9_-]{20,}\b/g,
+  // OpenAI project API keys
+  /\bsk-or-[A-Za-z0-9_-]{20,}\b/g,
+  // OpenRouter API keys
+  /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+  // OpenAI / generic sk- API keys
+  /\bgsk_[A-Za-z0-9_-]{20,}\b/g,
+  // Groq API keys
+  /\bhf_[A-Za-z0-9]{20,}\b/g,
+  // Hugging Face tokens
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g,
   // GitHub tokens
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
@@ -42883,7 +42897,11 @@ var CREDENTIAL_PATTERNS = [
   /([?&](?:key|api_key|apikey|access_token)=)[^&\s"']+/gi,
   // credentials in URLs
   /(x-goog-api-key["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
-  // Gemini auth header
+  // Google auth header
+  /(x-api-key["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
+  // Anthropic / generic x-api-key header
+  /(api-key["']?\s*[:=]\s*["']?)[^\s"',}]+/gi,
+  // Azure OpenAI api-key header
   /(authorization["']?\s*[:=]\s*["']?(?:bearer|token)\s+)[^\s"',}]+/gi
   // auth headers
 ];
@@ -47092,16 +47110,25 @@ function getOctokit(token, options, ...additionalPlugins) {
 }
 
 // src/config.ts
+var PROVIDERS = ["gemini", "openai", "anthropic", "openai-compatible"];
+var PROVIDER_DEFAULT_MODELS = {
+  gemini: "gemini-3.8-flash",
+  openai: "gpt-4.1-mini",
+  anthropic: "claude-sonnet-4-20250514",
+  "openai-compatible": "gpt-4.1-mini"
+};
 var DEFAULTS2 = {
+  provider: "auto",
   model: "gemini-3.8-flash",
   maxFiles: 50,
   maxDiffChars: 1e5,
   maxFindings: 20,
   reviewLanguage: "English",
   customInstructions: "",
-  instructionsFile: ".github/gemini-review.md",
+  instructionsFile: ".github/ai-review.md",
+  legacyInstructionsFile: ".github/gemini-review.md",
   useDefaultIgnores: true,
-  commentTitle: "Gemini AI Code Review",
+  commentTitle: "AI Code Review",
   temperature: 0.2,
   failOnError: true
 };
@@ -47144,23 +47171,104 @@ function parseBoolean(name, raw, fallback) {
 function parseList(raw) {
   return raw.split(/[\n,]/).map((item) => item.trim()).filter((item) => item.length > 0 && !item.startsWith("#"));
 }
-var MODEL_ID_PATTERN = /^(?:models\/)?[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+var MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+function isValidModelId(model) {
+  return MODEL_ID_PATTERN.test(model) && !model.includes("..") && !model.includes("//");
+}
+function parseProviderInput(raw) {
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === "" || normalized === "auto") return "auto";
+  if (normalized === "google") return "gemini";
+  if (normalized === "claude") return "anthropic";
+  if (normalized === "openrouter" || normalized === "ollama" || normalized === "custom") {
+    return "openai-compatible";
+  }
+  if (PROVIDERS.includes(normalized)) {
+    return normalized;
+  }
+  throw new ConfigError(
+    `Input "provider" must be one of "auto", "gemini", "openai", "anthropic", or "openai-compatible", got "${raw.trim()}".`
+  );
+}
+function detectProvider(explicit, rawModel, baseUrl2, apiKey) {
+  if (explicit !== "auto") return explicit;
+  if (baseUrl2) {
+    const lowerUrl = baseUrl2.toLowerCase();
+    if (lowerUrl.includes("anthropic.com")) return "anthropic";
+    if (lowerUrl.includes("googleapis.com")) return "gemini";
+    if (lowerUrl.includes("api.openai.com")) return "openai";
+    return "openai-compatible";
+  }
+  const lowerModel = rawModel.trim().toLowerCase();
+  if (lowerModel) {
+    if (lowerModel.startsWith("claude-") || lowerModel.startsWith("anthropic/")) {
+      return lowerModel.startsWith("anthropic/") ? "openai-compatible" : "anthropic";
+    }
+    if (lowerModel.startsWith("gpt-") || lowerModel.startsWith("chatgpt-") || /^o[134](?:$|-)/.test(lowerModel)) {
+      return "openai";
+    }
+    if (lowerModel.startsWith("gemini-") || lowerModel.startsWith("models/gemini-")) {
+      return "gemini";
+    }
+    if (lowerModel.includes("/")) {
+      return "openai-compatible";
+    }
+  }
+  if (apiKey.startsWith("sk-ant-")) return "anthropic";
+  if (apiKey.startsWith("sk-or-")) return "openai-compatible";
+  if (apiKey.startsWith("sk-")) return "openai";
+  return "gemini";
+}
+function validateBaseUrl(raw) {
+  const trimmed = raw.trim();
+  if (!trimmed) return void 0;
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    throw new ConfigError(`Input "base_url" is not a valid URL: "${trimmed}".`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new ConfigError(`Input "base_url" must use http:// or https://, got "${parsed.protocol}".`);
+  }
+  return trimmed.replace(/\/+$/, "");
+}
+function isLocalhostUrl(url2) {
+  if (!url2) return false;
+  try {
+    const parsed = new URL(url2);
+    return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1";
+  } catch {
+    return false;
+  }
+}
 function loadConfig(read) {
-  const geminiApiKey = read("gemini_api_key").trim();
-  if (geminiApiKey === "") {
+  const providerInput = parseProviderInput(read("provider"));
+  const baseUrl2 = validateBaseUrl(read("base_url"));
+  let apiKey = read("api_key").trim() || read("gemini_api_key").trim();
+  if (apiKey === "" && isLocalhostUrl(baseUrl2)) {
+    apiKey = "local-no-key";
+  }
+  if (apiKey === "") {
     throw new MissingApiKeyError(
-      'The "gemini_api_key" input is empty. Add a repository secret named GEMINI_API_KEY and pass it with `gemini_api_key: ${{ secrets.GEMINI_API_KEY }}`. Note: secrets are not available to workflows triggered by pull requests from forks.'
+      "No AI API key was provided. Pass `api_key: ${{ secrets.AI_API_KEY }}` (or `gemini_api_key: ${{ secrets.GEMINI_API_KEY }}`). Note: repository secrets are not available to workflows triggered by pull requests from forks."
     );
   }
-  registerSecret(geminiApiKey);
+  if (apiKey !== "local-no-key") {
+    registerSecret(apiKey);
+  }
   const githubToken = read("github_token").trim();
   if (githubToken === "") {
-    throw new ConfigError('The "github_token" input is empty. It defaults to ${{ github.token }}; do not override it with an empty value.');
+    throw new ConfigError(
+      'The "github_token" input is empty. It defaults to ${{ github.token }}; do not override it with an empty value.'
+    );
   }
   registerSecret(githubToken);
-  const model = read("model").trim() || DEFAULTS2.model;
-  if (!MODEL_ID_PATTERN.test(model)) {
-    throw new ConfigError(`Input "model" is not a valid Gemini model identifier: "${model}".`);
+  const rawModel = read("model").trim();
+  const provider = detectProvider(providerInput, rawModel, baseUrl2, apiKey);
+  const model = rawModel || PROVIDER_DEFAULT_MODELS[provider];
+  if (!isValidModelId(model)) {
+    throw new ConfigError(`Input "model" is not a valid model identifier: "${model}".`);
   }
   const customInstructions = read("custom_instructions").trim();
   if (customInstructions.length > LIMITS.customInstructionsChars) {
@@ -47171,7 +47279,10 @@ function loadConfig(read) {
   const commentTitle = (read("comment_title").trim() || DEFAULTS2.commentTitle).replace(/[\r\n]+/g, " ").slice(0, LIMITS.commentTitleChars);
   const instructionsFile = read("instructions_file").trim();
   return {
-    geminiApiKey,
+    provider,
+    apiKey,
+    geminiApiKey: apiKey,
+    baseUrl: baseUrl2,
     githubToken,
     model,
     maxFiles: parseInteger("max_files", read("max_files"), DEFAULTS2.maxFiles, LIMITS.maxFiles.min, LIMITS.maxFiles.max),
@@ -96774,7 +96885,7 @@ var REVIEW_RESPONSE_JSON_SCHEMA = {
 };
 
 // src/gemini/retry.ts
-var RETRYABLE_STATUS_CODES = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504]);
+var RETRYABLE_STATUS_CODES = /* @__PURE__ */ new Set([408, 429, 500, 502, 503, 504, 529]);
 var NON_RETRYABLE_STATUS_CODES = /* @__PURE__ */ new Set([400, 401, 403, 404, 422]);
 var TRANSIENT_NETWORK_PATTERN = /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|UND_ERR_[A-Z_]+|fetch failed|network error|socket hang up|timed? ?out)\b/i;
 var defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -96813,45 +96924,51 @@ function parseRetryAfterMs(err, nowMs = Date.now()) {
   }
   return void 0;
 }
-function classifyGeminiError(err, model) {
-  if (err instanceof GeminiError) return err;
+function classifyProviderError(err, model, providerLabel = "Gemini") {
+  if (err instanceof AiProviderError) return err;
   const status = getStatus(err);
   const retryAfterMs = parseRetryAfterMs(err);
   const rawDesc = describeError(err);
   if (status !== void 0) {
     if (NON_RETRYABLE_STATUS_CODES.has(status)) {
-      const hint = status === 401 || status === 403 ? "Verify that GEMINI_API_KEY is valid and enabled for the Gemini API." : status === 404 ? `Verify that model "${model}" exists and is available to your API key.` : "Check the request configuration and model parameters.";
-      return new GeminiError(
-        `Gemini API request failed with HTTP ${status} (model "${model}"). ${hint} Details: ${rawDesc}`,
+      const hint = status === 401 || status === 403 ? "Verify that your API key is valid and has permission for the configured provider." : status === 404 ? `Verify that model "${model}" and base URL exist and are available to your API key.` : "Check the request configuration and model parameters.";
+      return new AiProviderError(
+        `${providerLabel} API request failed with HTTP ${status} (model "${model}"). ${hint} Details: ${rawDesc}`,
         status,
-        false
+        false,
+        void 0,
+        providerLabel
       );
     }
     if (RETRYABLE_STATUS_CODES.has(status)) {
       const rateHint = status === 429 ? "Rate limit or quota exceeded (HTTP 429)." : `Transient server error (HTTP ${status}).`;
-      return new GeminiError(
-        `Gemini API temporary failure on model "${model}": ${rateHint} Details: ${rawDesc}`,
+      return new AiProviderError(
+        `${providerLabel} API temporary failure on model "${model}": ${rateHint} Details: ${rawDesc}`,
         status,
         true,
-        retryAfterMs
+        retryAfterMs,
+        providerLabel
       );
     }
-    return new GeminiError(
-      `Gemini API error HTTP ${status} (model "${model}"): ${rawDesc}`,
+    return new AiProviderError(
+      `${providerLabel} API error HTTP ${status} (model "${model}"): ${rawDesc}`,
       status,
       status >= 500,
-      retryAfterMs
+      retryAfterMs,
+      providerLabel
     );
   }
   const isTransientNetwork = TRANSIENT_NETWORK_PATTERN.test(rawDesc);
-  return new GeminiError(
-    `Gemini API error (model "${model}"): ${rawDesc}`,
+  return new AiProviderError(
+    `${providerLabel} API error (model "${model}"): ${rawDesc}`,
     void 0,
     isTransientNetwork,
-    retryAfterMs
+    retryAfterMs,
+    providerLabel
   );
 }
 async function withRetry(operation, model, options = {}) {
+  const providerLabel = options.providerName ?? "Gemini";
   const maxAttempts = Math.max(1, options.maxAttempts ?? 3);
   const baseDelayMs = options.baseDelayMs ?? 1500;
   const maxDelayMs = options.maxDelayMs ?? 3e4;
@@ -96862,7 +96979,7 @@ async function withRetry(operation, model, options = {}) {
     try {
       return await operation(attempt);
     } catch (err) {
-      const classified = classifyGeminiError(err, model);
+      const classified = classifyProviderError(err, model, providerLabel);
       lastError = classified;
       if (!classified.retryable || attempt >= maxAttempts) {
         throw classified;
@@ -96875,16 +96992,33 @@ async function withRetry(operation, model, options = {}) {
       await sleep2(delayMs);
     }
   }
-  throw lastError ?? new GeminiError(`Gemini request failed after ${maxAttempts} attempts.`, void 0, false);
+  throw lastError ?? new AiProviderError(
+    `${providerLabel} request failed after ${maxAttempts} attempts.`,
+    void 0,
+    false,
+    void 0,
+    providerLabel
+  );
 }
 
 // src/gemini/client.ts
+async function readErrorBody(response) {
+  try {
+    const text = await response.text();
+    return text.slice(0, 600);
+  } catch {
+    return response.statusText || "HTTP error";
+  }
+}
 var GoogleGenAIClient = class {
   models;
   retryOptions;
-  constructor(apiKey, retryOptions = {}, modelsOverride) {
-    this.models = modelsOverride ?? new GoogleGenAI2({ apiKey }).models;
-    this.retryOptions = retryOptions;
+  constructor(apiKey, retryOptions = {}, modelsOverride, baseUrl2) {
+    this.models = modelsOverride ?? new GoogleGenAI2({
+      apiKey,
+      ...baseUrl2 ? { httpOptions: { baseUrl: baseUrl2 } } : {}
+    }).models;
+    this.retryOptions = { providerName: "Gemini", ...retryOptions };
   }
   async generateReview(request2) {
     return withRetry(
@@ -96902,19 +97036,23 @@ var GoogleGenAIClient = class {
         const blockReason = response.promptFeedback?.blockReason;
         if (blockReason) {
           const detail = response.promptFeedback?.blockReasonMessage ? `: ${response.promptFeedback.blockReasonMessage}` : "";
-          throw new GeminiError(
+          throw new AiProviderError(
             `Gemini blocked the review prompt (${blockReason}${detail}).`,
             void 0,
-            false
+            false,
+            void 0,
+            "Gemini"
           );
         }
         const text = response.text?.trim() ?? "";
         if (!text) {
           const finishReason = response.candidates?.[0]?.finishReason ?? "UNKNOWN";
-          throw new GeminiError(
+          throw new AiProviderError(
             `Gemini returned an empty response (finishReason: ${finishReason}).`,
             void 0,
-            false
+            false,
+            void 0,
+            "Gemini"
           );
         }
         return {
@@ -96931,6 +97069,190 @@ var GoogleGenAIClient = class {
     );
   }
 };
+var OpenAICompatibleClient = class {
+  apiKey;
+  baseUrl;
+  providerLabel;
+  retryOptions;
+  fetchImpl;
+  constructor(options) {
+    this.apiKey = options.apiKey;
+    const defaultBase = options.apiKey.startsWith("sk-or-") ? "https://openrouter.ai/api/v1" : "https://api.openai.com/v1";
+    this.baseUrl = (options.baseUrl ?? defaultBase).replace(/\/+$/, "");
+    this.providerLabel = options.providerLabel ?? "OpenAI";
+    this.retryOptions = { providerName: this.providerLabel, ...options.retryOptions };
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  }
+  async generateReview(request2) {
+    return withRetry(
+      async () => {
+        const isReasoningModel = /^o[134](?:$|-)/i.test(request2.model);
+        const body = {
+          model: request2.model,
+          messages: [
+            { role: "system", content: request2.systemInstruction },
+            { role: "user", content: request2.userPrompt }
+          ],
+          response_format: { type: "json_object" }
+        };
+        if (!isReasoningModel) {
+          body.temperature = request2.temperature;
+        }
+        const headers = {
+          "Content-Type": "application/json"
+        };
+        if (this.apiKey && this.apiKey !== "local-no-key") {
+          headers.Authorization = `Bearer ${this.apiKey}`;
+        }
+        const endpoint2 = this.baseUrl.endsWith("/chat/completions") ? this.baseUrl : `${this.baseUrl}/chat/completions`;
+        const response = await this.fetchImpl(endpoint2, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body)
+        });
+        if (!response.ok) {
+          const errorBody = await readErrorBody(response);
+          throw Object.assign(new Error(`HTTP ${response.status}: ${errorBody}`), {
+            status: response.status,
+            headers: response.headers
+          });
+        }
+        const payload = await response.json();
+        const choice = payload.choices?.[0];
+        if (choice?.message?.refusal) {
+          throw new AiProviderError(
+            `${this.providerLabel} refused the review request: ${choice.message.refusal}`,
+            void 0,
+            false,
+            void 0,
+            this.providerLabel
+          );
+        }
+        const text = choice?.message?.content?.trim() ?? "";
+        if (!text) {
+          const finishReason = choice?.finish_reason ?? "UNKNOWN";
+          throw new AiProviderError(
+            `${this.providerLabel} returned an empty response (finish_reason: ${finishReason}).`,
+            void 0,
+            false,
+            void 0,
+            this.providerLabel
+          );
+        }
+        return {
+          text,
+          usage: {
+            promptTokens: payload.usage?.prompt_tokens,
+            candidateTokens: payload.usage?.completion_tokens,
+            totalTokens: payload.usage?.total_tokens
+          }
+        };
+      },
+      request2.model,
+      this.retryOptions
+    );
+  }
+};
+var AnthropicClient = class {
+  apiKey;
+  baseUrl;
+  retryOptions;
+  fetchImpl;
+  constructor(options) {
+    this.apiKey = options.apiKey;
+    this.baseUrl = (options.baseUrl ?? "https://api.anthropic.com/v1").replace(/\/+$/, "");
+    this.retryOptions = { providerName: "Anthropic", ...options.retryOptions };
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  }
+  async generateReview(request2) {
+    return withRetry(
+      async () => {
+        const endpoint2 = this.baseUrl.endsWith("/messages") ? this.baseUrl : `${this.baseUrl}/messages`;
+        const response = await this.fetchImpl(endpoint2, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": this.apiKey,
+            "anthropic-version": "2023-06-01"
+          },
+          body: JSON.stringify({
+            model: request2.model,
+            max_tokens: 8192,
+            temperature: Math.min(1, request2.temperature),
+            system: request2.systemInstruction,
+            messages: [{ role: "user", content: request2.userPrompt }]
+          })
+        });
+        if (!response.ok) {
+          const errorBody = await readErrorBody(response);
+          throw Object.assign(new Error(`HTTP ${response.status}: ${errorBody}`), {
+            status: response.status,
+            headers: response.headers
+          });
+        }
+        const payload = await response.json();
+        const text = (payload.content ?? []).filter((block) => block.type === "text" && typeof block.text === "string").map((block) => block.text).join("\n").trim();
+        if (!text) {
+          const stopReason = payload.stop_reason ?? "UNKNOWN";
+          throw new AiProviderError(
+            `Anthropic returned an empty response (stop_reason: ${stopReason}).`,
+            void 0,
+            false,
+            void 0,
+            "Anthropic"
+          );
+        }
+        const promptTokens = payload.usage?.input_tokens;
+        const candidateTokens = payload.usage?.output_tokens;
+        const totalTokens = promptTokens !== void 0 || candidateTokens !== void 0 ? (promptTokens ?? 0) + (candidateTokens ?? 0) : void 0;
+        return {
+          text,
+          usage: {
+            promptTokens,
+            candidateTokens,
+            totalTokens
+          }
+        };
+      },
+      request2.model,
+      this.retryOptions
+    );
+  }
+};
+function createAiClient(options) {
+  switch (options.provider) {
+    case "gemini":
+      return new GoogleGenAIClient(
+        options.apiKey,
+        options.retryOptions,
+        void 0,
+        options.baseUrl
+      );
+    case "anthropic":
+      return new AnthropicClient({
+        apiKey: options.apiKey,
+        baseUrl: options.baseUrl,
+        retryOptions: options.retryOptions,
+        fetchImpl: options.fetchImpl
+      });
+    case "openai":
+      return new OpenAICompatibleClient({
+        apiKey: options.apiKey,
+        baseUrl: options.baseUrl,
+        providerLabel: "OpenAI",
+        retryOptions: options.retryOptions,
+        fetchImpl: options.fetchImpl
+      });
+    case "openai-compatible":
+      return new OpenAICompatibleClient({
+        apiKey: options.apiKey,
+        baseUrl: options.baseUrl,
+        providerLabel: "OpenAI-compatible",
+        retryOptions: options.retryOptions,
+        fetchImpl: options.fetchImpl
+      });
+  }
+}
 
 // src/github/client.ts
 var MAX_INSTRUCTIONS_FILE_BYTES = 32768;
@@ -97277,7 +97599,7 @@ ${renderFooter(options.model, options.headSha, options.usage)}`;
 }
 function formatSkippedReviewComment(options) {
   const { commentTitle, model, headSha, extracted } = options;
-  const reason = extracted.excluded.length === 0 ? "This pull request contains no changed files." : `All ${extracted.excluded.length} changed file(s) in this pull request were excluded by filter or budget rules, so no diff was sent to Gemini.`;
+  const reason = extracted.excluded.length === 0 ? "This pull request contains no changed files." : `All ${extracted.excluded.length} changed file(s) in this pull request were excluded by filter or budget rules, so no diff was sent for AI review.`;
   return [
     COMMENT_MARKER,
     `## ${sanitizeMarkdownText(commentTitle)}`,
@@ -97346,7 +97668,28 @@ function buildReviewPrompt(input2) {
     "  - `       - | <code>` is a deleted line (no new-file line number).",
     "- Set each finding's `file` to the exact repository path shown for that file.",
     "- Set `line` to the integer new-file line number from the left gutter where the issue occurs, or `null` if the finding applies to the whole file or only to deleted lines.",
-    "- NEVER guess or calculate line numbers that are not explicitly shown in the left gutter."
+    "- NEVER guess or calculate line numbers that are not explicitly shown in the left gutter.",
+    "",
+    "### Required Output Format (JSON Object Only)",
+    "- Respond with ONLY a single valid JSON object (no markdown prose outside JSON) matching this structure:",
+    "  {",
+    '    "summary": "<2-4 sentence executive summary>",',
+    '    "risk_level": "low" | "medium" | "high" | "critical",',
+    '    "findings": [',
+    "      {",
+    '        "file": "<exact repo-relative file path>",',
+    '        "line": <integer new-file line number or null>,',
+    '        "severity": "critical" | "high" | "medium" | "low",',
+    '        "category": "bug" | "security" | "performance" | "maintainability" | "testing" | "style",',
+    '        "title": "<short one-line title>",',
+    '        "description": "<clear explanation>",',
+    '        "impact": "<concrete runtime/security/maintenance consequence>",',
+    '        "suggestion": "<actionable fix>",',
+    '        "evidence": "<short excerpt from the diff>"',
+    "      }",
+    "    ],",
+    '    "positive_observations": ["<brief positive note>"]',
+    "  }"
   ];
   const trustedCustom = input2.customInstructions?.trim();
   if (trustedCustom) {
@@ -97557,15 +97900,12 @@ function addTokens(a, b) {
 }
 async function run(deps = {}) {
   const host = deps.host ?? createDefaultHost();
-  const rawGeminiKey = host.getInput("gemini_api_key").trim();
-  if (rawGeminiKey) {
-    host.setSecret(rawGeminiKey);
-    registerSecret(rawGeminiKey);
-  }
-  const rawGithubToken = host.getInput("github_token").trim();
-  if (rawGithubToken) {
-    host.setSecret(rawGithubToken);
-    registerSecret(rawGithubToken);
+  for (const keyInput of ["api_key", "gemini_api_key", "github_token"]) {
+    const rawSecret = host.getInput(keyInput).trim();
+    if (rawSecret) {
+      host.setSecret(rawSecret);
+      registerSecret(rawSecret);
+    }
   }
   let event;
   try {
@@ -97586,7 +97926,7 @@ async function run(deps = {}) {
   } catch (err) {
     if (err instanceof MissingApiKeyError && event.isForkFromPayload) {
       host.notice(
-        "Skipping Gemini PR review: pull request originates from a fork and GEMINI_API_KEY is not available to fork workflows."
+        "Skipping AI PR review: pull request originates from a fork and repository secrets are not available to fork workflows."
       );
       host.setOutput("reviewed_files", 0);
       host.setOutput("excluded_files", 0);
@@ -97603,13 +97943,18 @@ async function run(deps = {}) {
   const github = (deps.createGitHubClient ?? ((token) => new OctokitGitHubClient(token)))(
     config2.githubToken
   );
-  const gemini = (deps.createGeminiClient ?? ((apiKey, h2) => new GoogleGenAIClient(apiKey, {
-    onRetry: (attempt, delayMs, error63) => {
-      h2.warning(
-        `Gemini request attempt ${attempt} failed (${describeError(error63)}); retrying in ${delayMs}ms\u2026`
-      );
+  const aiClient = deps.createAiClient ? deps.createAiClient(config2, host) : deps.createGeminiClient ? deps.createGeminiClient(config2.apiKey, host) : createAiClient({
+    provider: config2.provider,
+    apiKey: config2.apiKey,
+    baseUrl: config2.baseUrl,
+    retryOptions: {
+      onRetry: (attempt, delayMs, error63) => {
+        host.warning(
+          `AI provider (${config2.provider}) attempt ${attempt} failed (${describeError(error63)}); retrying in ${delayMs}ms\u2026`
+        );
+      }
     }
-  })))(config2.geminiApiKey, host);
+  });
   let prHeadSha = "";
   let extracted = {
     reviewed: [],
@@ -97621,7 +97966,7 @@ async function run(deps = {}) {
     const pr = await github.getPullRequest(event.owner, event.repo, event.pullNumber);
     prHeadSha = pr.headSha;
     if (pr.draft) {
-      host.info(`Pull request #${pr.number} is a draft; skipping Gemini review.`);
+      host.info(`Pull request #${pr.number} is a draft; skipping AI review.`);
       host.setOutput("reviewed_files", 0);
       host.setOutput("excluded_files", 0);
       host.setOutput("findings_count", 0);
@@ -97638,7 +97983,7 @@ async function run(deps = {}) {
     host.setOutput("excluded_files", extracted.excluded.length);
     if (extracted.reviewed.length === 0) {
       host.info(
-        `No reviewable files remained after filtering (${extracted.excluded.length} excluded). Posting skipped-review summary without calling Gemini.`
+        `No reviewable files remained after filtering (${extracted.excluded.length} excluded). Posting skipped-review summary without calling the AI provider.`
       );
       const body2 = formatSkippedReviewComment({
         commentTitle: config2.commentTitle,
@@ -97669,8 +98014,16 @@ async function run(deps = {}) {
         config2.instructionsFile,
         pr.baseSha
       );
+      if (!repoInstructions && config2.instructionsFile === DEFAULTS2.instructionsFile) {
+        repoInstructions = await github.getFileContent(
+          event.owner,
+          event.repo,
+          DEFAULTS2.legacyInstructionsFile,
+          pr.baseSha
+        );
+      }
       if (repoInstructions) {
-        host.info(`Loaded repository review instructions from "${config2.instructionsFile}" (base branch).`);
+        host.info(`Loaded repository review instructions from base branch (${pr.baseSha.slice(0, 7)}).`);
       }
     }
     const builtPrompt = buildReviewPrompt({
@@ -97686,9 +98039,9 @@ async function run(deps = {}) {
       repoInstructions
     });
     host.info(
-      `Requesting Gemini review with model "${config2.model}" (${extracted.reviewed.length} file(s), ${extracted.totalDiffChars} diff chars)\u2026`
+      `Requesting AI review via provider "${config2.provider}" with model "${config2.model}" (${extracted.reviewed.length} file(s), ${extracted.totalDiffChars} diff chars)\u2026`
     );
-    const firstAttempt = await gemini.generateReview({
+    const firstAttempt = await aiClient.generateReview({
       model: config2.model,
       systemInstruction: builtPrompt.systemInstruction,
       userPrompt: builtPrompt.userPrompt,
@@ -97707,7 +98060,7 @@ async function run(deps = {}) {
         throw validationErr;
       }
       host.warning(
-        `Initial Gemini response failed validation (${describeError(validationErr)}). Requesting a single schema-repair pass\u2026`
+        `Initial AI response failed validation (${describeError(validationErr)}). Requesting a single schema-repair pass\u2026`
       );
       const repairPrompt = buildRepairUserPrompt(
         builtPrompt.userPrompt,
@@ -97715,7 +98068,7 @@ async function run(deps = {}) {
         validationErr.message,
         builtPrompt.nonce
       );
-      const secondAttempt = await gemini.generateReview({
+      const secondAttempt = await aiClient.generateReview({
         model: config2.model,
         systemInstruction: builtPrompt.systemInstruction,
         userPrompt: repairPrompt,
@@ -97760,7 +98113,7 @@ async function run(deps = {}) {
     host.setOutput("comment_id", published.id);
     host.setOutput("comment_url", published.htmlUrl);
     host.info(
-      `Published Gemini review comment (${published.updated ? "updated" : "created"}): ${published.htmlUrl}`
+      `Published AI review comment (${published.updated ? "updated" : "created"}): ${published.htmlUrl}`
     );
   } catch (err) {
     const safeMessage = describeError(err);
@@ -97791,7 +98144,7 @@ async function run(deps = {}) {
     if (config2.failOnError) {
       host.setFailed(safeMessage);
     } else {
-      host.warning(`Gemini PR review did not complete (fail_on_error=false): ${safeMessage}`);
+      host.warning(`AI PR review did not complete (fail_on_error=false): ${safeMessage}`);
     }
   }
 }

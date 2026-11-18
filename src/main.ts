@@ -1,12 +1,12 @@
 /**
- * Core orchestration for the Gemini PR Reviewer action.
+ * Core orchestration for the AI Pull Request Reviewer action.
  *
- * All external collaborators (Actions runtime host, GitHub client, Gemini client)
+ * All external collaborators (Actions runtime host, GitHub client, AI client)
  * are injected so the full workflow can be tested end-to-end without network calls.
  */
 import * as core from '@actions/core';
 import { context as githubContext } from '@actions/github';
-import { type ReviewerConfig, loadConfig } from './config.js';
+import { DEFAULTS, type ReviewerConfig, loadConfig } from './config.js';
 import { type ExtractedDiff, extractDiff } from './diff/extract.js';
 import { FileFilter } from './diff/filters.js';
 import {
@@ -17,9 +17,9 @@ import {
   registerSecret,
 } from './errors.js';
 import {
-  type GeminiClient,
-  GoogleGenAIClient,
+  type AiClient,
   type TokenUsage,
+  createAiClient,
 } from './gemini/client.js';
 import {
   type GitHubClient,
@@ -62,7 +62,9 @@ export interface RunDependencies {
   host?: ActionHost;
   event?: EventContext;
   createGitHubClient?: (token: string) => GitHubClient;
-  createGeminiClient?: (apiKey: string, host: ActionHost) => GeminiClient;
+  createAiClient?: (config: ReviewerConfig, host: ActionHost) => AiClient;
+  /** Backwards-compatible hook for tests. */
+  createGeminiClient?: (apiKey: string, host: ActionHost) => AiClient;
 }
 
 export function createDefaultHost(): ActionHost {
@@ -119,15 +121,12 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
   const host = deps.host ?? createDefaultHost();
 
   // Immediately mask raw secrets before any parsing or logging can happen.
-  const rawGeminiKey = host.getInput('gemini_api_key').trim();
-  if (rawGeminiKey) {
-    host.setSecret(rawGeminiKey);
-    registerSecret(rawGeminiKey);
-  }
-  const rawGithubToken = host.getInput('github_token').trim();
-  if (rawGithubToken) {
-    host.setSecret(rawGithubToken);
-    registerSecret(rawGithubToken);
+  for (const keyInput of ['api_key', 'gemini_api_key', 'github_token']) {
+    const rawSecret = host.getInput(keyInput).trim();
+    if (rawSecret) {
+      host.setSecret(rawSecret);
+      registerSecret(rawSecret);
+    }
   }
 
   let event: EventContext;
@@ -151,7 +150,7 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
   } catch (err) {
     if (err instanceof MissingApiKeyError && event.isForkFromPayload) {
       host.notice(
-        'Skipping Gemini PR review: pull request originates from a fork and GEMINI_API_KEY is not available to fork workflows.',
+        'Skipping AI PR review: pull request originates from a fork and repository secrets are not available to fork workflows.',
       );
       host.setOutput('reviewed_files', 0);
       host.setOutput('excluded_files', 0);
@@ -169,17 +168,22 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
   const github = (deps.createGitHubClient ?? ((token) => new OctokitGitHubClient(token)))(
     config.githubToken,
   );
-  const gemini = (
-    deps.createGeminiClient ??
-    ((apiKey, h) =>
-      new GoogleGenAIClient(apiKey, {
-        onRetry: (attempt, delayMs, error) => {
-          h.warning(
-            `Gemini request attempt ${attempt} failed (${describeError(error)}); retrying in ${delayMs}ms…`,
-          );
-        },
-      }))
-  )(config.geminiApiKey, host);
+  const aiClient: AiClient = deps.createAiClient
+    ? deps.createAiClient(config, host)
+    : deps.createGeminiClient
+      ? deps.createGeminiClient(config.apiKey, host)
+      : createAiClient({
+          provider: config.provider,
+          apiKey: config.apiKey,
+          baseUrl: config.baseUrl,
+          retryOptions: {
+            onRetry: (attempt, delayMs, error) => {
+              host.warning(
+                `AI provider (${config.provider}) attempt ${attempt} failed (${describeError(error)}); retrying in ${delayMs}ms…`,
+              );
+            },
+          },
+        });
 
   let prHeadSha = '';
   let extracted: ExtractedDiff = {
@@ -194,7 +198,7 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
     prHeadSha = pr.headSha;
 
     if (pr.draft) {
-      host.info(`Pull request #${pr.number} is a draft; skipping Gemini review.`);
+      host.info(`Pull request #${pr.number} is a draft; skipping AI review.`);
       host.setOutput('reviewed_files', 0);
       host.setOutput('excluded_files', 0);
       host.setOutput('findings_count', 0);
@@ -214,7 +218,7 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
 
     if (extracted.reviewed.length === 0) {
       host.info(
-        `No reviewable files remained after filtering (${extracted.excluded.length} excluded). Posting skipped-review summary without calling Gemini.`,
+        `No reviewable files remained after filtering (${extracted.excluded.length} excluded). Posting skipped-review summary without calling the AI provider.`,
       );
       const body = formatSkippedReviewComment({
         commentTitle: config.commentTitle,
@@ -246,8 +250,16 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
         config.instructionsFile,
         pr.baseSha,
       );
+      if (!repoInstructions && config.instructionsFile === DEFAULTS.instructionsFile) {
+        repoInstructions = await github.getFileContent(
+          event.owner,
+          event.repo,
+          DEFAULTS.legacyInstructionsFile,
+          pr.baseSha,
+        );
+      }
       if (repoInstructions) {
-        host.info(`Loaded repository review instructions from "${config.instructionsFile}" (base branch).`);
+        host.info(`Loaded repository review instructions from base branch (${pr.baseSha.slice(0, 7)}).`);
       }
     }
 
@@ -265,10 +277,10 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
     });
 
     host.info(
-      `Requesting Gemini review with model "${config.model}" (${extracted.reviewed.length} file(s), ${extracted.totalDiffChars} diff chars)…`,
+      `Requesting AI review via provider "${config.provider}" with model "${config.model}" (${extracted.reviewed.length} file(s), ${extracted.totalDiffChars} diff chars)…`,
     );
 
-    const firstAttempt = await gemini.generateReview({
+    const firstAttempt = await aiClient.generateReview({
       model: config.model,
       systemInstruction: builtPrompt.systemInstruction,
       userPrompt: builtPrompt.userPrompt,
@@ -289,7 +301,7 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
         throw validationErr;
       }
       host.warning(
-        `Initial Gemini response failed validation (${describeError(validationErr)}). Requesting a single schema-repair pass…`,
+        `Initial AI response failed validation (${describeError(validationErr)}). Requesting a single schema-repair pass…`,
       );
       const repairPrompt = buildRepairUserPrompt(
         builtPrompt.userPrompt,
@@ -297,7 +309,7 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
         validationErr.message,
         builtPrompt.nonce,
       );
-      const secondAttempt = await gemini.generateReview({
+      const secondAttempt = await aiClient.generateReview({
         model: config.model,
         systemInstruction: builtPrompt.systemInstruction,
         userPrompt: repairPrompt,
@@ -346,7 +358,7 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
     host.setOutput('comment_id', published.id);
     host.setOutput('comment_url', published.htmlUrl);
     host.info(
-      `Published Gemini review comment (${published.updated ? 'updated' : 'created'}): ${published.htmlUrl}`,
+      `Published AI review comment (${published.updated ? 'updated' : 'created'}): ${published.htmlUrl}`,
     );
   } catch (err) {
     const safeMessage = describeError(err);
@@ -379,8 +391,7 @@ export async function run(deps: RunDependencies = {}): Promise<void> {
     if (config.failOnError) {
       host.setFailed(safeMessage);
     } else {
-      host.warning(`Gemini PR review did not complete (fail_on_error=false): ${safeMessage}`);
+      host.warning(`AI PR review did not complete (fail_on_error=false): ${safeMessage}`);
     }
   }
 }
-

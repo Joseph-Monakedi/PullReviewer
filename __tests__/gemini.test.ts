@@ -1,10 +1,17 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GeminiError, registerSecret } from '../src/errors.js';
-import { type GenAIModelsLike, GoogleGenAIClient } from '../src/gemini/client.js';
+import { AiProviderError, GeminiError, registerSecret } from '../src/errors.js';
+import {
+  AnthropicClient,
+  type FetchLike,
+  type GenAIModelsLike,
+  GoogleGenAIClient,
+  OpenAICompatibleClient,
+  createAiClient,
+} from '../src/gemini/client.js';
 import { parseRetryAfterMs } from '../src/gemini/retry.js';
 
-describe('GoogleGenAIClient & retry logic', () => {
-  it('returns text and token usage on first-attempt success', async () => {
+describe('Multi-provider AI clients & retry logic', () => {
+  it('GoogleGenAIClient returns text and token usage on first-attempt success', async () => {
     const models: GenAIModelsLike = {
       generateContent: vi.fn().mockResolvedValue({
         text: '{"summary":"ok","risk_level":"low","findings":[],"positive_observations":[]}',
@@ -30,6 +37,140 @@ describe('GoogleGenAIClient & retry logic', () => {
       candidateTokens: 45,
       totalTokens: 165,
     });
+  });
+
+  it('OpenAICompatibleClient calls /chat/completions and parses usage', async () => {
+    const fakeFetch: FetchLike = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content:
+                  '{"summary":"openai ok","risk_level":"low","findings":[],"positive_observations":[]}',
+              },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: {
+            prompt_tokens: 200,
+            completion_tokens: 60,
+            total_tokens: 260,
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const client = createAiClient({
+      provider: 'openai',
+      apiKey: 'sk-proj-testkey12345678901234567890',
+      retryOptions: { sleep: async () => {} },
+      fetchImpl: fakeFetch,
+    });
+
+    const res = await client.generateReview({
+      model: 'gpt-4.1-mini',
+      systemInstruction: 'sys',
+      userPrompt: 'usr',
+      temperature: 0.2,
+    });
+
+    expect(res.text).toContain('openai ok');
+    expect(res.usage).toEqual({
+      promptTokens: 200,
+      candidateTokens: 60,
+      totalTokens: 260,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(
+      'https://api.openai.com/v1/chat/completions',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('AnthropicClient calls /messages with x-api-key and parses token usage', async () => {
+    const fakeFetch: FetchLike = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          content: [
+            {
+              type: 'text',
+              text: '{"summary":"claude ok","risk_level":"low","findings":[],"positive_observations":[]}',
+            },
+          ],
+          stop_reason: 'end_turn',
+          usage: {
+            input_tokens: 300,
+            output_tokens: 90,
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+
+    const client = new AnthropicClient({
+      apiKey: 'sk-ant-testkey12345678901234567890',
+      retryOptions: { sleep: async () => {} },
+      fetchImpl: fakeFetch,
+    });
+
+    const res = await client.generateReview({
+      model: 'claude-sonnet-4-20250514',
+      systemInstruction: 'sys',
+      userPrompt: 'usr',
+      temperature: 0.2,
+    });
+
+    expect(res.text).toContain('claude ok');
+    expect(res.usage).toEqual({
+      promptTokens: 300,
+      candidateTokens: 90,
+      totalTokens: 390,
+    });
+    expect(fakeFetch).toHaveBeenCalledWith(
+      'https://api.anthropic.com/v1/messages',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it('OpenAICompatibleClient retries on 429 and 503 and succeeds', async () => {
+    const fakeFetch: FetchLike = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response('Rate limited', { status: 429, headers: { 'retry-after': '1' } }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content:
+                    '{"summary":"recovered","risk_level":"low","findings":[],"positive_observations":[]}',
+                },
+              },
+            ],
+            usage: { total_tokens: 100 },
+          }),
+          { status: 200 },
+        ),
+      );
+
+    const client = new OpenAICompatibleClient({
+      apiKey: 'sk-or-v1-testkey12345678901234567890',
+      providerLabel: 'OpenRouter',
+      retryOptions: { sleep: async () => {} },
+      fetchImpl: fakeFetch,
+    });
+
+    const res = await client.generateReview({
+      model: 'deepseek/deepseek-r1',
+      systemInstruction: 'sys',
+      userPrompt: 'usr',
+      temperature: 0.2,
+    });
+    expect(res.text).toContain('recovered');
+    expect(fakeFetch).toHaveBeenCalledTimes(2);
   });
 
   it('retries on 429 and 503 with Retry-After support and succeeds', async () => {
@@ -99,7 +240,8 @@ describe('GoogleGenAIClient & retry logic', () => {
       }),
     ).rejects.toSatisfy((err: unknown) => {
       expect(err).toBeInstanceOf(GeminiError);
-      const ge = err as GeminiError;
+      expect(err).toBeInstanceOf(AiProviderError);
+      const ge = err as AiProviderError;
       expect(ge.status).toBe(401);
       expect(ge.retryable).toBe(false);
       expect(ge.message).not.toContain(secretKey);
@@ -157,4 +299,3 @@ describe('GoogleGenAIClient & retry logic', () => {
     ).toBe(5000);
   });
 });
-

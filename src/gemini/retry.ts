@@ -1,19 +1,20 @@
 /**
  * Retry helper with exponential backoff, jitter, and Retry-After support for
- * transient Gemini API and network failures.
+ * transient AI provider API and network failures.
  */
-import { GeminiError, describeError, getStatus } from '../errors.js';
+import { AiProviderError, describeError, getStatus } from '../errors.js';
 
 export interface RetryOptions {
+  providerName?: string;
   maxAttempts?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
-  onRetry?: (attempt: number, delayMs: number, error: GeminiError) => void;
+  onRetry?: (attempt: number, delayMs: number, error: AiProviderError) => void;
 }
 
-const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504, 529]);
 const NON_RETRYABLE_STATUS_CODES = new Set([400, 401, 403, 404, 422]);
 
 const TRANSIENT_NETWORK_PATTERN =
@@ -69,9 +70,13 @@ export function parseRetryAfterMs(err: unknown, nowMs: number = Date.now()): num
   return undefined;
 }
 
-/** Convert an arbitrary error from the Gemini SDK into a classified, redacted GeminiError. */
-export function classifyGeminiError(err: unknown, model: string): GeminiError {
-  if (err instanceof GeminiError) return err;
+/** Convert an arbitrary error from an AI SDK or fetch call into a classified, redacted AiProviderError. */
+export function classifyProviderError(
+  err: unknown,
+  model: string,
+  providerLabel = 'Gemini',
+): AiProviderError {
+  if (err instanceof AiProviderError) return err;
 
   const status = getStatus(err);
   const retryAfterMs = parseRetryAfterMs(err);
@@ -81,14 +86,16 @@ export function classifyGeminiError(err: unknown, model: string): GeminiError {
     if (NON_RETRYABLE_STATUS_CODES.has(status)) {
       const hint =
         status === 401 || status === 403
-          ? 'Verify that GEMINI_API_KEY is valid and enabled for the Gemini API.'
+          ? 'Verify that your API key is valid and has permission for the configured provider.'
           : status === 404
-            ? `Verify that model "${model}" exists and is available to your API key.`
+            ? `Verify that model "${model}" and base URL exist and are available to your API key.`
             : 'Check the request configuration and model parameters.';
-      return new GeminiError(
-        `Gemini API request failed with HTTP ${status} (model "${model}"). ${hint} Details: ${rawDesc}`,
+      return new AiProviderError(
+        `${providerLabel} API request failed with HTTP ${status} (model "${model}"). ${hint} Details: ${rawDesc}`,
         status,
         false,
+        undefined,
+        providerLabel,
       );
     }
     if (RETRYABLE_STATUS_CODES.has(status)) {
@@ -96,48 +103,55 @@ export function classifyGeminiError(err: unknown, model: string): GeminiError {
         status === 429
           ? 'Rate limit or quota exceeded (HTTP 429).'
           : `Transient server error (HTTP ${status}).`;
-      return new GeminiError(
-        `Gemini API temporary failure on model "${model}": ${rateHint} Details: ${rawDesc}`,
+      return new AiProviderError(
+        `${providerLabel} API temporary failure on model "${model}": ${rateHint} Details: ${rawDesc}`,
         status,
         true,
         retryAfterMs,
+        providerLabel,
       );
     }
-    return new GeminiError(
-      `Gemini API error HTTP ${status} (model "${model}"): ${rawDesc}`,
+    return new AiProviderError(
+      `${providerLabel} API error HTTP ${status} (model "${model}"): ${rawDesc}`,
       status,
       status >= 500,
       retryAfterMs,
+      providerLabel,
     );
   }
 
   const isTransientNetwork = TRANSIENT_NETWORK_PATTERN.test(rawDesc);
-  return new GeminiError(
-    `Gemini API error (model "${model}"): ${rawDesc}`,
+  return new AiProviderError(
+    `${providerLabel} API error (model "${model}"): ${rawDesc}`,
     undefined,
     isTransientNetwork,
     retryAfterMs,
+    providerLabel,
   );
 }
+
+/** Backwards-compatible alias for classifyProviderError. */
+export const classifyGeminiError = classifyProviderError;
 
 export async function withRetry<T>(
   operation: (attempt: number) => Promise<T>,
   model: string,
   options: RetryOptions = {},
 ): Promise<T> {
+  const providerLabel = options.providerName ?? 'Gemini';
   const maxAttempts = Math.max(1, options.maxAttempts ?? 3);
   const baseDelayMs = options.baseDelayMs ?? 1_500;
   const maxDelayMs = options.maxDelayMs ?? 30_000;
   const sleep = options.sleep ?? defaultSleep;
   const random = options.random ?? Math.random;
 
-  let lastError: GeminiError | undefined;
+  let lastError: AiProviderError | undefined;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await operation(attempt);
     } catch (err) {
-      const classified = classifyGeminiError(err, model);
+      const classified = classifyProviderError(err, model, providerLabel);
       lastError = classified;
 
       if (!classified.retryable || attempt >= maxAttempts) {
@@ -154,6 +168,14 @@ export async function withRetry<T>(
     }
   }
 
-  throw lastError ?? new GeminiError(`Gemini request failed after ${maxAttempts} attempts.`, undefined, false);
+  throw (
+    lastError ??
+    new AiProviderError(
+      `${providerLabel} request failed after ${maxAttempts} attempts.`,
+      undefined,
+      false,
+      undefined,
+      providerLabel,
+    )
+  );
 }
-

@@ -11,25 +11,29 @@ export class ConfigError extends Error {
   override readonly name: string = 'ConfigError';
 }
 
-/** The Gemini API key input is empty (common for fork PRs, where secrets are withheld). */
+/** The AI provider API key input is empty (common for fork PRs, where secrets are withheld). */
 export class MissingApiKeyError extends ConfigError {
   override readonly name = 'MissingApiKeyError';
 }
 
-/** A failure talking to the Gemini API. */
-export class GeminiError extends Error {
-  override readonly name = 'GeminiError';
+/** A failure talking to the configured AI provider API. */
+export class AiProviderError extends Error {
+  override readonly name: string = 'AiProviderError';
   constructor(
     message: string,
     readonly status: number | undefined,
     readonly retryable: boolean,
     readonly retryAfterMs?: number,
+    readonly provider?: string,
   ) {
     super(message);
   }
 }
 
-/** Gemini returned something that is not a valid review document. */
+/** Backwards-compatible alias for AiProviderError. */
+export { AiProviderError as GeminiError };
+
+/** The AI model returned something that is not a valid review document. */
 export class ResponseValidationError extends Error {
   override readonly name = 'ResponseValidationError';
 }
@@ -57,13 +61,21 @@ export function clearRegisteredSecrets(): void {
   registeredSecrets.clear();
 }
 
-/** Well-known credential shapes, redacted even if they were never registered. */
+/** Well-known credential shapes across AI providers & GitHub, redacted even if never registered. */
 const CREDENTIAL_PATTERNS: RegExp[] = [
-  /AIza[0-9A-Za-z_-]{30,}/g, // Google API keys
+  /AIza[0-9A-Za-z_-]{30,}/g, // Google / Gemini API keys
+  /\bsk-ant-[A-Za-z0-9_-]{20,}\b/g, // Anthropic API keys
+  /\bsk-proj-[A-Za-z0-9_-]{20,}\b/g, // OpenAI project API keys
+  /\bsk-or-[A-Za-z0-9_-]{20,}\b/g, // OpenRouter API keys
+  /\bsk-[A-Za-z0-9_-]{20,}\b/g, // OpenAI / generic sk- API keys
+  /\bgsk_[A-Za-z0-9_-]{20,}\b/g, // Groq API keys
+  /\bhf_[A-Za-z0-9]{20,}\b/g, // Hugging Face tokens
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g, // GitHub tokens
   /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, // GitHub fine-grained PATs
   /([?&](?:key|api_key|apikey|access_token)=)[^&\s"']+/gi, // credentials in URLs
-  /(x-goog-api-key["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, // Gemini auth header
+  /(x-goog-api-key["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, // Google auth header
+  /(x-api-key["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, // Anthropic / generic x-api-key header
+  /(api-key["']?\s*[:=]\s*["']?)[^\s"',}]+/gi, // Azure OpenAI api-key header
   /(authorization["']?\s*[:=]\s*["']?(?:bearer|token)\s+)[^\s"',}]+/gi, // auth headers
 ];
 

@@ -1,7 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { DEFAULTS, loadConfig, parseList } from '../src/config.js';
+import {
+  DEFAULTS,
+  PROVIDER_DEFAULT_MODELS,
+  detectProvider,
+  loadConfig,
+  parseList,
+} from '../src/config.js';
 import {
   ConfigError,
   MissingApiKeyError,
@@ -11,7 +17,7 @@ import {
 
 function makeReader(overrides: Record<string, string> = {}): (name: string) => string {
   const base: Record<string, string> = {
-    gemini_api_key: 'AIzaSyTestKey123456789012345678901234',
+    api_key: 'AIzaSyTestKey123456789012345678901234',
     github_token: 'ghs_testGitHubToken12345678901234567890',
     ...overrides,
   };
@@ -25,6 +31,7 @@ describe('config', () => {
 
   it('loads defaults when optional inputs are empty', () => {
     const cfg = loadConfig(makeReader());
+    expect(cfg.provider).toBe('gemini');
     expect(cfg.model).toBe(DEFAULTS.model);
     expect(cfg.maxFiles).toBe(DEFAULTS.maxFiles);
     expect(cfg.maxDiffChars).toBe(DEFAULTS.maxDiffChars);
@@ -41,6 +48,7 @@ describe('config', () => {
 
   it('keeps DEFAULTS in sync with action.yml', () => {
     const actionYml = readFileSync(resolve(process.cwd(), 'action.yml'), 'utf8');
+    expect(actionYml).toContain(`default: '${DEFAULTS.provider}'`);
     expect(actionYml).toContain(`default: '${DEFAULTS.model}'`);
     expect(actionYml).toContain(`default: '${DEFAULTS.maxFiles}'`);
     expect(actionYml).toContain(`default: '${DEFAULTS.maxDiffChars}'`);
@@ -51,24 +59,69 @@ describe('config', () => {
     expect(actionYml).toContain(`default: '${DEFAULTS.temperature}'`);
   });
 
-  it('registers gemini_api_key and github_token for secret redaction', () => {
+  it('auto-detects provider from model, base_url, or api_key prefix and picks provider default models', () => {
+    expect(detectProvider('auto', 'claude-sonnet-4-20250514', undefined, 'key')).toBe('anthropic');
+    expect(detectProvider('auto', 'gpt-4.1', undefined, 'key')).toBe('openai');
+    expect(detectProvider('auto', 'o3-mini', undefined, 'key')).toBe('openai');
+    expect(detectProvider('auto', 'gemini-3.8-flash', undefined, 'key')).toBe('gemini');
+    expect(detectProvider('auto', 'deepseek/deepseek-r1', undefined, 'key')).toBe('openai-compatible');
+    expect(
+      detectProvider('auto', '', 'https://openrouter.ai/api/v1', 'key'),
+    ).toBe('openai-compatible');
+    expect(detectProvider('auto', '', undefined, 'sk-ant-api03-12345678901234567890')).toBe(
+      'anthropic',
+    );
+    expect(detectProvider('auto', '', undefined, 'sk-proj-12345678901234567890')).toBe('openai');
+
+    const anthropicCfg = loadConfig(
+      makeReader({ provider: 'anthropic', api_key: 'sk-ant-test12345678901234567890' }),
+    );
+    expect(anthropicCfg.provider).toBe('anthropic');
+    expect(anthropicCfg.model).toBe(PROVIDER_DEFAULT_MODELS.anthropic);
+
+    const openaiCfg = loadConfig(
+      makeReader({ provider: 'openai', api_key: 'sk-proj-test12345678901234567890' }),
+    );
+    expect(openaiCfg.provider).toBe('openai');
+    expect(openaiCfg.model).toBe(PROVIDER_DEFAULT_MODELS.openai);
+  });
+
+  it('allows keyless localhost base_url for local Ollama / vLLM instances', () => {
+    const cfg = loadConfig(
+      makeReader({
+        api_key: '',
+        base_url: 'http://localhost:11434/v1/',
+        model: 'qwen2.5-coder:32b',
+      }),
+    );
+    expect(cfg.provider).toBe('openai-compatible');
+    expect(cfg.baseUrl).toBe('http://localhost:11434/v1');
+    expect(cfg.model).toBe('qwen2.5-coder:32b');
+  });
+
+  it('registers api_key and github_token for secret redaction', () => {
     loadConfig(
       makeReader({
-        gemini_api_key: 'my-custom-gemini-secret-value',
+        api_key: 'my-custom-ai-secret-value',
         github_token: 'my-custom-github-secret-value',
       }),
     );
-    expect(redact('leaked my-custom-gemini-secret-value and my-custom-github-secret-value')).toBe(
+    expect(redact('leaked my-custom-ai-secret-value and my-custom-github-secret-value')).toBe(
       'leaked *** and ***',
     );
   });
 
-  it('throws MissingApiKeyError when gemini_api_key is missing', () => {
-    expect(() => loadConfig(makeReader({ gemini_api_key: '   ' }))).toThrow(MissingApiKeyError);
+  it('throws MissingApiKeyError when both api_key and gemini_api_key are missing', () => {
+    expect(() => loadConfig(makeReader({ api_key: '   ' }))).toThrow(MissingApiKeyError);
   });
 
-  it('throws ConfigError when github_token is empty', () => {
+  it('throws ConfigError when github_token, provider, or base_url is invalid', () => {
     expect(() => loadConfig(makeReader({ github_token: '' }))).toThrow(ConfigError);
+    expect(() => loadConfig(makeReader({ provider: 'unknown-provider' }))).toThrow(ConfigError);
+    expect(() => loadConfig(makeReader({ base_url: 'ftp://invalid.example.com' }))).toThrow(
+      ConfigError,
+    );
+    expect(() => loadConfig(makeReader({ base_url: 'not a url' }))).toThrow(ConfigError);
   });
 
   it('validates numeric bounds and integer constraints', () => {
@@ -95,7 +148,7 @@ describe('config', () => {
     expect(() => loadConfig(makeReader({ use_default_ignores: 'maybe' }))).toThrow(ConfigError);
   });
 
-  it('rejects malformed model identifiers and oversized custom instructions', () => {
+  it('rejects path-traversal model identifiers and oversized custom instructions', () => {
     expect(() => loadConfig(makeReader({ model: '../evil/path' }))).toThrow(ConfigError);
     expect(() =>
       loadConfig(makeReader({ custom_instructions: 'x'.repeat(10_001) })),
@@ -122,4 +175,3 @@ describe('config', () => {
     ]);
   });
 });
-

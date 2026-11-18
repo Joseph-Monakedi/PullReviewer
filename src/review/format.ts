@@ -314,7 +314,7 @@ export function formatSkippedReviewComment(options: FormatCommonContext): string
   const reason =
     extracted.excluded.length === 0
       ? 'This pull request contains no changed files.'
-      : `All ${extracted.excluded.length} changed file(s) in this pull request were excluded by filter or budget rules, so no diff was sent to Gemini.`;
+      : `All ${extracted.excluded.length} changed file(s) in this pull request were excluded by filter or budget rules, so no diff was sent for AI review.`;
 
   return [
     COMMENT_MARKER,
