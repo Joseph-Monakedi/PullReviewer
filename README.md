@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run AI PR Reviewer
-        uses: YOUR_ORG/ai-pr-reviewer@v1
+        uses: Joseph-Monakedi/PullReviewer@v1
         with:
           api_key: ${{ secrets.AI_API_KEY }}
           model: gemini-3.8-flash # or gpt-4.1-mini, claude-sonnet-4-20250514, etc.
@@ -87,7 +87,7 @@ jobs:
 
 #### Google Gemini
 ```yaml
-      - uses: YOUR_ORG/ai-pr-reviewer@v1
+      - uses: Joseph-Monakedi/PullReviewer@v1
         with:
           provider: gemini
           api_key: ${{ secrets.GEMINI_API_KEY }}
@@ -96,7 +96,7 @@ jobs:
 
 #### OpenAI
 ```yaml
-      - uses: YOUR_ORG/ai-pr-reviewer@v1
+      - uses: Joseph-Monakedi/PullReviewer@v1
         with:
           provider: openai
           api_key: ${{ secrets.OPENAI_API_KEY }}
@@ -105,7 +105,7 @@ jobs:
 
 #### Anthropic Claude
 ```yaml
-      - uses: YOUR_ORG/ai-pr-reviewer@v1
+      - uses: Joseph-Monakedi/PullReviewer@v1
         with:
           provider: anthropic
           api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -114,7 +114,7 @@ jobs:
 
 #### OpenRouter / DeepSeek / Groq / Mistral / Custom Gateway
 ```yaml
-      - uses: YOUR_ORG/ai-pr-reviewer@v1
+      - uses: Joseph-Monakedi/PullReviewer@v1
         with:
           provider: openai-compatible
           base_url: https://openrouter.ai/api/v1 # or https://api.deepseek.com/v1, https://api.groq.com/openai/v1
@@ -124,7 +124,7 @@ jobs:
 
 #### Local Ollama / vLLM (Self-Hosted Runner, No API Key Needed)
 ```yaml
-      - uses: YOUR_ORG/ai-pr-reviewer@v1
+      - uses: Joseph-Monakedi/PullReviewer@v1
         with:
           provider: openai-compatible
           base_url: http://localhost:11434/v1

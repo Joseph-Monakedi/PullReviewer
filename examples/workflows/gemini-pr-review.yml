@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Run AI PR Reviewer
-        uses: YOUR_ORG/ai-pr-reviewer@v1
+        uses: Joseph-Monakedi/PullReviewer@v1
         with:
           # Works with any provider: "auto" (default), "gemini", "openai", "anthropic", or "openai-compatible"
           provider: auto
