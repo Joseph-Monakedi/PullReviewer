@@ -1,0 +1,81 @@
+name: 'Gemini AI Pull Request Reviewer'
+description: 'Language-agnostic GitHub Action that reviews pull request diffs with Google Gemini and upserts one structured, advisory review comment.'
+branding:
+  icon: 'check-circle'
+  color: 'blue'
+
+inputs:
+  gemini_api_key:
+    description: 'Google Gemini API key (pass via secrets.GEMINI_API_KEY).'
+    required: true
+  github_token:
+    description: 'GitHub token used to read PR diffs and upsert the review comment.'
+    required: false
+    default: '${{ github.token }}'
+  model:
+    description: 'Gemini model identifier used to generate the review.'
+    required: false
+    default: 'gemini-3.8-flash'
+  max_files:
+    description: 'Maximum number of changed files (after ignore filters) to include in a single review.'
+    required: false
+    default: '50'
+  max_diff_chars:
+    description: 'Maximum total annotated diff characters sent to Gemini (~25k tokens at default).'
+    required: false
+    default: '100000'
+  max_findings:
+    description: 'Maximum number of findings included in the published review comment.'
+    required: false
+    default: '20'
+  review_language:
+    description: 'Natural language for the review summary and findings.'
+    required: false
+    default: 'English'
+  custom_instructions:
+    description: 'Trusted additional review instructions defined directly in the workflow file.'
+    required: false
+    default: ''
+  instructions_file:
+    description: 'Repository-relative path to a Markdown file with project review guidelines (loaded from the base branch only; set to "none" to disable).'
+    required: false
+    default: '.github/gemini-review.md'
+  ignore_patterns:
+    description: 'Newline- or comma-separated glob patterns to exclude from review (supports !negation).'
+    required: false
+    default: ''
+  use_default_ignores:
+    description: 'Whether to apply built-in ignore patterns for lockfiles, build outputs, minified files, and binaries.'
+    required: false
+    default: 'true'
+  comment_title:
+    description: 'Heading used at the top of the pull request review comment.'
+    required: false
+    default: 'Gemini AI Code Review'
+  temperature:
+    description: 'Sampling temperature for Gemini (0.0 to 2.0).'
+    required: false
+    default: '0.2'
+  fail_on_error:
+    description: 'Whether to fail the workflow step when Gemini or GitHub API calls fail after retries.'
+    required: false
+    default: 'true'
+
+outputs:
+  risk_level:
+    description: 'Overall merge risk assessment reported by Gemini (low, medium, high, critical).'
+  findings_count:
+    description: 'Number of validated findings included in the review comment.'
+  comment_id:
+    description: 'ID of the created or updated GitHub issue comment.'
+  comment_url:
+    description: 'HTML URL of the created or updated GitHub issue comment.'
+  reviewed_files:
+    description: 'Number of files included in the Gemini review.'
+  excluded_files:
+    description: 'Number of changed files excluded by filters or budget limits.'
+
+runs:
+  using: 'node24'
+  main: 'dist/index.js'
+

@@ -1,0 +1,158 @@
+# Gemini AI Pull Request Reviewer
+
+A reusable, language-agnostic GitHub Action (`node24`, bundled TypeScript ESM) that reviews pull request diffs using Google's official `@google/genai` SDK and upserts a single structured, advisory review comment per pull request.
+
+---
+
+## ⚠️ Data Privacy & Tier Notice
+
+> **Google Gemini API Data Governance:**
+> - **Free Tier API keys:** Google may log and review prompts and responses (which include your PR diffs and source code) to train and improve its products. **Do not use a Free Tier API key on private or proprietary repositories.**
+> - **Paid / Billing-Enabled Tier API keys:** Under Google's Gemini API Terms of Service for paid services, prompts and responses are **not** used to train Google models. Always provision a billing-enabled Google Cloud project key for private or proprietary codebases.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  PR["GitHub PR Event\n(opened / synchronize)"] --> GH["Octokit GitHub Client\nFetch PR metadata, files & base rules"]
+  GH --> Filter["Diff Filter & Budgeter\nIgnore globs + greedy char budget"]
+  Filter -->|0 reviewable files| Skip["Upsert Skipped Notice"]
+  Filter -->|Reviewed hunks with line gutter| Prompt["Prompt Builder\nSystem rules + Nonce-fenced untrusted diff"]
+  Prompt --> Gemini["Google GenAI SDK\nStructured JSON + Retry/Backoff"]
+  Gemini --> Validate["Validator & Grounder\nZod schema + verify file & visible line"]
+  Validate -->|Invalid JSON once| Gemini
+  Validate --> Format["Markdown Formatter\nSanitise HTML/@mentions + cap 62k chars"]
+  Format --> Upsert["Marker Upsert\n<!-- gemini-pr-reviewer:v1 -->"]
+```
+
+### Key Characteristics
+- **Zero checkout required:** Fetches PR metadata, changed files, and base-branch review guidelines exclusively through the GitHub REST API. Untrusted PR code is never checked out or executed.
+- **Single-comment upsert:** Identifies its own bot comment via `<!-- gemini-pr-reviewer:v1 -->` and updates it in place on subsequent commits.
+- **Line-number grounding:** Diffs are annotated with explicit new-file line numbers (`42 + | const x = 1;`). Every model finding is verified against the reviewed file set and visible hunk lines:
+  - Findings referencing files outside the reviewed diff are discarded.
+  - Findings referencing line numbers outside the visible diff hunks have their line reset to `null` (kept as file-level findings).
+- **Prompt-injection isolation:** System instructions and trusted repository guidelines live exclusively in `systemInstruction`. Untrusted PR titles, descriptions, file paths, and patches are isolated in the user turn inside random per-run nonce delimiters (`<<UNTRUSTED_DATA_<nonce>:...>>`).
+
+---
+
+## Quick Start
+
+1. Add a `GEMINI_API_KEY` secret to your repository (**Settings → Secrets and variables → Actions**).
+2. Create `.github/workflows/gemini-pr-review.yml`:
+
+```yaml
+name: Gemini PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: gemini-pr-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: AI Code Review
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Gemini PR Reviewer
+        # For supply-chain security, pin to a full commit SHA in production:
+        # uses: YOUR_ORG/gemini-pr-reviewer@<40-char-commit-sha>
+        uses: YOUR_ORG/gemini-pr-reviewer@v1
+        with:
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          model: gemini-3.8-flash
+          max_files: '50'
+          max_diff_chars: '100000'
+          max_findings: '20'
+```
+
+3. *(Optional)* Add project-specific review rules in `.github/gemini-review.md` on your default/base branch. The action reads this file from the **base branch** (`base.sha`) so pull requests cannot tamper with their own review rules.
+
+---
+
+## Configuration
+
+### Inputs
+
+| Input | Default | Required | Description |
+| :--- | :--- | :---: | :--- |
+| `gemini_api_key` | — | **Yes** | Google Gemini API key. Immediately masked via `core.setSecret` and redacted from all logs/errors. |
+| `github_token` | `${{ github.token }}` | No | GitHub token with `contents: read` and `pull-requests: write`. |
+| `model` | `gemini-3.8-flash` | No | Gemini model identifier (e.g., `gemini-3.8-flash`, `gemini-4-argon`, `gemini-4-hydrogen`). |
+| `max_files` | `50` | No | Maximum number of files (after ignore filters) to review (`1`–`3000`). |
+| `max_diff_chars` | `100000` | No | Total annotated diff character budget (`1000`–`2000000`, ~25k tokens at default). |
+| `max_findings` | `20` | No | Maximum number of findings rendered in the comment (`1`–`100`). |
+| `review_language` | `English` | No | Natural language used for the summary and findings. |
+| `custom_instructions` | `""` | No | Trusted inline instructions from the workflow file (max 10,000 chars). |
+| `instructions_file` | `.github/gemini-review.md` | No | Path to repo guidelines read from the **base branch** (`none` or `false` to disable). |
+| `ignore_patterns` | `""` | No | Newline- or comma-separated globs added to defaults (supports `!negation` and `#` comments). |
+| `use_default_ignores` | `true` | No | Exclude lockfiles, `dist/`, `build/`, `node_modules/`, minified files, source maps, and binaries. |
+| `comment_title` | `Gemini AI Code Review` | No | Heading at the top of the review comment. |
+| `temperature` | `0.2` | No | Sampling temperature (`0.0`–`2.0`). |
+| `fail_on_error` | `true` | No | Fail the workflow step if Gemini or GitHub calls fail after retries (`false` downgrades to warning). |
+
+### Outputs
+
+| Output | Description |
+| :--- | :--- |
+| `risk_level` | Overall risk reported by Gemini (`low`, `medium`, `high`, `critical`). |
+| `findings_count` | Number of grounded findings included in the review comment. |
+| `comment_id` | ID of the created or updated GitHub issue comment. |
+| `comment_url` | HTML URL of the created or updated GitHub issue comment. |
+| `reviewed_files` | Count of files included in the review prompt. |
+| `excluded_files` | Count of files excluded by ignore patterns, missing patch, `max_files`, or `max_diff_chars`. |
+
+---
+
+## Platform Limitations & Edge Cases
+
+### Fork Pull Requests
+GitHub intentionally withholds repository secrets and downgrades `GITHUB_TOKEN` to read-only on `pull_request` workflows triggered from forks.
+- When this action detects a fork PR with an empty `gemini_api_key`, it emits a workflow notice and **exits cleanly (status 0)** so external contributors are not blocked by a red CI check.
+- **Do not use `pull_request_target`** to expose secrets to untrusted fork PRs. To review a fork contribution safely, inspect the diff first and either push the branch to the upstream repository or trigger a maintainer-gated workflow.
+
+### Dependabot Pull Requests
+Workflows triggered by Dependabot read secrets from the **Dependabot secrets store**, not the standard Actions secrets store. Add `GEMINI_API_KEY` under **Settings → Secrets and variables → Dependabot** if you want Dependabot PRs reviewed (note that lockfiles are ignored by default unless `use_default_ignores: 'false'` or `!package-lock.json` is configured).
+
+### Large PRs & Binary Files
+- GitHub's `pulls.listFiles` endpoint returns at most 3,000 files and omits `patch` for binary files and very large single-file diffs.
+- Files without a patch or exceeding `max_files` / `max_diff_chars` are never silently marked as reviewed; every excluded file and its exclusion reason is listed in the collapsible **Review scope** section of the PR comment.
+
+---
+
+## Security Design
+
+1. **No Untrusted Code Execution:** The action operates purely over the GitHub API without `actions/checkout` or installing PR dependencies.
+2. **Secret Redaction:** `gemini_api_key` and `github_token` are passed to `core.setSecret` immediately on startup and scrubbed via `redact()` (along with regex patterns for `AIza*`, `ghp_*`, `github_pat_*`, auth headers, and URL query keys) before any error or log message is emitted.
+3. **Prompt-Injection Defences:**
+   - System rules and trusted instructions are placed strictly in `systemInstruction`.
+   - All PR-supplied text is wrapped in per-run random nonce tags (`<<UNTRUSTED_DATA_<nonce>:...>>`), with any colliding substrings escaped.
+   - `instructions_file` is fetched at `base.sha`, never `head.sha`.
+   - No model tools, function calling, or code execution are enabled.
+4. **Output Sanitisation:** All model output rendered into GitHub Markdown has raw HTML escaped (`<` / `>`), `@mentions` and `#123` references neutralised with a zero-width joiner to prevent notification spam, remote images (`![alt](url)`) and external links stripped, and code excerpts wrapped in dynamically lengthened backtick fences.
+
+---
+
+## Local Development
+
+Requires **Node.js ≥ 24**.
+
+```bash
+npm install
+npm run typecheck   # tsc --noEmit
+npm test            # vitest run
+npm run coverage    # vitest run --coverage
+npm run build       # bundles src/index.ts -> dist/index.js via esbuild
+npm run all         # typecheck + test + build
+```
+

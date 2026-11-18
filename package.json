@@ -1,0 +1,41 @@
+{
+  "name": "gemini-pr-reviewer",
+  "version": "1.0.0",
+  "description": "Language-agnostic, Gemini-powered pull request reviewer packaged as a GitHub Action.",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "all": "npm run typecheck && npm test && npm run build"
+  },
+  "keywords": [
+    "github-action",
+    "code-review",
+    "gemini",
+    "ai",
+    "pull-request"
+  ],
+  "dependencies": {
+    "@actions/core": "3.0.1",
+    "@actions/github": "9.1.1",
+    "@google/genai": "3.6.0",
+    "minimatch": "11.0.9",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@vitest/coverage-v8": "5.1.1",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2",
+    "vitest": "5.1.1"
+  }
+}
